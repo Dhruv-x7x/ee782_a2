@@ -1,0 +1,4 @@
+guard mode on
+guard on
+guardmode on
+guard mode activate

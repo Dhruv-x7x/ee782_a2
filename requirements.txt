@@ -1,0 +1,17 @@
+mediapipe==0.10.8
+deepface==0.0.79
+
+sounddevice==0.4.6
+soundfile==0.12.1
+SpeechRecognition==3.10.0
+pyttsx3==2.90
+
+tensorflow==2.15.0
+keras==2.15.0
+Pillow>=9.0.0
+gdown>=4.6.0
+tqdm>=4.64.0
+mtcnn>=0.1.1
+retina-face>=0.0.13
+
+setuptools>=65.0.0
