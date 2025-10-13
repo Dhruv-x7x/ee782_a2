@@ -1,5 +1,9 @@
 ## Assignment #2 EE782 - AI Guard Agent
 
+## Team
+- Dhruv Meena 22b1279
+- Madhava Sriram 22b1233
+
 ## To run
 
 After cloning repo and making it current working directory.
