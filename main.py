@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-"""
-main.py — AI Guard Agent (Corrected Version)
-
-Fixed Issues:
-- Proper threading locks for audio resource management
-- webrtcvad for Voice Activity Detection
-- MediaPipe for faster face detection
-- Fixed enrollment process (only works when disarmed)
-- Collective escalation for unknown faces
-- Comprehensive error handling and recovery
-- Resource cleanup handlers
-- Removed "add activation phrase" feature
-
-Requirements: Python 3.11.9, Windows
-"""
 
 import os
 import time
@@ -41,7 +26,7 @@ from deepface import DeepFace
 INPUT_DEVICE_INDEX = 4
 OUTPUT_DEVICE_INDEX = None
 
-ASR_RECORD_SECONDS = 2.0      # Increased for better transcription
+ASR_RECORD_SECONDS = 2.0
 ENROLL_NAME_RECORD_SECONDS = 2.0
 
 ACTIVATION_PHRASES_FILE = "activation_phrases.txt"
@@ -81,6 +66,8 @@ VAD_SPEECH_THRESHOLD = 0.4  # Increased from 0.3 - require 40% speech frames
 audio_lock = threading.Lock()  # Proper lock for audio resources
 tts_active = threading.Event()
 cleanup_files = []  # Track temp files for cleanup
+# near other globals
+asr_pause = threading.Event()   # when set, ASR thread will pause listening (useful during enrollment)
 
 # --------------------------
 # Cleanup handler
@@ -131,11 +118,6 @@ activation_phrases = load_activation_phrases()
 def setup_audio_devices():
     """Setup and validate audio devices"""
     try:
-        devices = sd.query_devices()
-        print(f"\n[AUDIO] Available devices:")
-        for i, dev in enumerate(devices):
-            print(f"  [{i}] {dev['name']}")
-        
         # Validate input device
         input_dev = sd.query_devices(INPUT_DEVICE_INDEX)
         if input_dev['max_input_channels'] < 1:
@@ -183,78 +165,213 @@ def say(text):
             print(f"[TTS] Error: {e}")
         finally:
             tts_active.clear()
-            time.sleep(0.2)  # Small delay to ensure audio output completes
+            time.sleep(0.8)  # Small delay to ensure audio output completes
 
 # --------------------------
 # VAD-enhanced recorder
 # --------------------------
 def record_wav_with_vad(device_index, duration, vad_mode=VAD_AGGRESSIVENESS):
-    """Record audio with Voice Activity Detection"""
+    """
+    Robust recording + WebRTC VAD wrapper.
+
+    Returns:
+        (fname_or_None, speech_ratio, used_samplerate)
+    Notes:
+        - Ensures audio passed to webrtcvad is one of {8000,16000,32000,48000}.
+        - Uses scipy.signal.resample_poly when available; falls back to linear interpolation.
+        - Writes wav only if speech_ratio > VAD_SPEECH_THRESHOLD.
+    """
+    SUPPORTED_VAD_RATES = (8000, 16000, 32000, 48000)
+    FALLBACK_RATES = [16000, 48000, 32000, 8000, 44100, 22050]  # try preferred first
     try:
         dev = sd.query_devices(device_index)
-        # Get device sample rate
+    except Exception as e:
+        print(f"[ASR] Failed to query device {device_index}: {e}")
+        traceback.print_exc()
+        return None, 0.0, None
+
+    # Determine candidate samplerate to record at
+    try:
         device_samplerate = int(dev.get('default_samplerate', 16000))
-        target_samplerate = 16000  # VAD requires 16kHz
-        channels = 1
-        
-        fname = f"tmp_asr_{datetime.utcnow().strftime('%Y%m%dT%H%M%S%f')}.wav"
-        cleanup_files.append(fname)
-        
+    except Exception:
+        device_samplerate = 16000
+
+    # Try to pick a record_rate that the device supports; prefer device default,
+    # but make sure we can feed a supported rate to VAD (we will resample if needed).
+    candidate_rates = [device_samplerate] + [r for r in FALLBACK_RATES if r != device_samplerate]
+
+    # Validate input settings; pick first rate that check_input_settings accepts.
+    record_rate = None
+    for sr in candidate_rates:
+        try:
+            sd.check_input_settings(device=device_index, samplerate=sr, channels=1)
+            record_rate = sr
+            break
+        except Exception:
+            # not supported directly, we'll still allow recording at device_samplerate
+            continue
+
+    if record_rate is None:
+        # Last resort: try device_samplerate without check (some devices accept but check fails)
+        record_rate = device_samplerate
+        print(f"[ASR] Warning: couldn't validate samplerate via check_input_settings; "
+              f"attempting record at device default {record_rate} Hz")
+
+    print(f"[ASR] Recording using device index {device_index} at {record_rate} Hz (device default: {device_samplerate} Hz)")
+
+    channels = 1
+    fname = None
+    tmp_name = f"tmp_asr_{datetime.utcnow().strftime('%Y%m%dT%H%M%S%f')}.wav"
+
+    try:
+        # Acquire audio lock and record
         with audio_lock:
-            rec = sd.rec(
-                int(duration * device_samplerate),
-                samplerate=device_samplerate,
-                channels=channels,
-                dtype='int16',
-                device=device_index
-            )
+            rec = sd.rec(int(duration * record_rate), samplerate=record_rate, channels=channels,
+                         dtype='int16', device=device_index)
             sd.wait()
-        
-        rec = np.asarray(rec).flatten()  # Ensure 1D array
-        
-        # Resample to 16kHz if needed (VAD requirement)
-        if device_samplerate != target_samplerate:
+
+        rec = np.asarray(rec)
+
+        # If multichannel, collapse to mono by averaging channels (shouldn't happen with channels=1)
+        if rec.ndim == 2 and rec.shape[1] > 1:
+            rec = np.mean(rec, axis=1)
+
+        # Flatten to 1-D int16 array
+        rec = rec.flatten().astype(np.int16)
+
+        # Quick RMS check for debugging
+        try:
+            rms = np.sqrt(np.mean((rec.astype(np.float32) / 32768.0) ** 2))
+        except Exception:
+            rms = 0.0
+        print(f"[ASR DEBUG] Recorded {len(rec)} samples @ {record_rate} Hz, RMS={rms:.6f}")
+
+        # Decide target sample rate for VAD (must be one of SUPPORTED_VAD_RATES)
+        # Prefer 16000 if possible
+        target_sr = 16000 if 16000 in SUPPORTED_VAD_RATES else SUPPORTED_VAD_RATES[0]
+        if record_rate in SUPPORTED_VAD_RATES:
+            target_sr = record_rate  # no resample required
+
+        # If resampling needed, try best available resampler
+        resampled = rec
+        used_sr = record_rate
+        if record_rate != target_sr:
             try:
-                from scipy import signal
-                num_samples = int(len(rec) * target_samplerate / device_samplerate)
-                rec = signal.resample(rec, num_samples).astype('int16')
-            except ImportError:
-                print("[ASR] Warning: scipy not available, using original sample rate")
-                target_samplerate = device_samplerate
-        
-        # Voice Activity Detection
+                # Preferred: scipy.signal.resample_poly for quality
+                from scipy.signal import resample_poly
+                # convert to float32 for resampling
+                rec_float = rec.astype(np.float32)
+                # resample_poly expects shape (n,)
+                gcd = np.gcd(target_sr, record_rate)
+                up = target_sr // gcd
+                down = record_rate // gcd
+                res = resample_poly(rec_float, up, down)
+                # scale/clip to int16
+                res = np.clip(res, -32768, 32767).astype(np.int16)
+                resampled = res
+                used_sr = target_sr
+                print(f"[ASR] Resampled from {record_rate} -> {target_sr} Hz using scipy.resample_poly")
+            except Exception as e:
+                # Fallback: simple linear interpolation resampler (lower quality)
+                try:
+                    print(f"[ASR] scipy resample not available or failed ({e}); using linear fallback")
+                    import math
+                    orig_len = len(rec)
+                    new_len = int(math.ceil(len(rec) * target_sr / record_rate))
+                    if orig_len < 2 or new_len < 1:
+                        resampled = rec.copy()
+                        used_sr = record_rate
+                    else:
+                        orig_idx = np.arange(orig_len)
+                        new_idx = np.linspace(0, orig_len - 1, new_len)
+                        res = np.interp(new_idx, orig_idx, rec.astype(np.float32))
+                        resampled = np.clip(res, -32768, 32767).astype(np.int16)
+                        used_sr = target_sr
+                    print(f"[ASR] Linear resample from {record_rate} -> {target_sr} Hz (len {orig_len}->{len(resampled)})")
+                except Exception as e2:
+                    print(f"[ASR] Resampling fallback failed: {e2}. Proceeding with original rate {record_rate}")
+                    resampled = rec
+                    used_sr = record_rate
+
+        # At this point `resampled` is int16 1-D and `used_sr` is the samplerate used for VAD.
+        if used_sr not in SUPPORTED_VAD_RATES:
+            # pick nearest supported rate and warn (but don't pass unsupported rate to VAD)
+            # prefer 16000/48000
+            fallback = 16000 if 16000 in SUPPORTED_VAD_RATES else SUPPORTED_VAD_RATES[0]
+            print(f"[ASR] Warning: used_sr={used_sr} not supported by VAD. Trying fallback {fallback} Hz.")
+            # try to resample to fallback quickly
+            try:
+                from scipy.signal import resample_poly
+                gcd = np.gcd(fallback, used_sr)
+                up = fallback // gcd
+                down = used_sr // gcd
+                res = resample_poly(resampled.astype(np.float32), up, down)
+                resampled = np.clip(res, -32768, 32767).astype(np.int16)
+                used_sr = fallback
+            except Exception:
+                # If scipy missing, last resort: set used_sr to record_rate and proceed (VAD may fail)
+                used_sr = record_rate
+
+        # Prepare frames for webrtcvad: must be 10/20/30 ms chunks
+        frame_ms = 30
+        frame_size = int(used_sr * frame_ms / 1000)
+        if frame_size <= 0:
+            print(f"[ASR] Invalid frame size {frame_size} for used_sr={used_sr}; aborting VAD")
+            return None, 0.0, used_sr
+
+        # Pad end so that length is multiple of frame_size
+        n = len(resampled)
+        remainder = n % frame_size
+        if remainder != 0:
+            pad_len = frame_size - remainder
+            resampled = np.concatenate([resampled, np.zeros(pad_len, dtype=np.int16)])
+            print(f"[ASR] Padded {pad_len} samples for full frames (new_len={len(resampled)})")
+
         vad = webrtcvad.Vad(vad_mode)
-        frame_duration = 30  # ms
-        frame_size = int(target_samplerate * frame_duration / 1000)
-        
         voiced_frames = 0
         total_frames = 0
-        
-        for i in range(0, len(rec) - frame_size, frame_size):
-            frame = rec[i:i + frame_size].tobytes()
-            total_frames += 1
+
+        for i in range(0, len(resampled), frame_size):
+            frame = resampled[i:i + frame_size]
+            if frame.size != frame_size:
+                # pad if somehow still not full
+                frame = np.pad(frame, (0, max(0, frame_size - frame.size)), 'constant')
             try:
-                if vad.is_speech(frame, target_samplerate):
+                is_speech = vad.is_speech(frame.tobytes(), used_sr)
+                if is_speech:
                     voiced_frames += 1
-            except:
-                pass
-        
-        # Calculate speech ratio
-        speech_ratio = voiced_frames / total_frames if total_frames > 0 else 0
-        
-        # Save only if sufficient speech detected
-        if speech_ratio > VAD_SPEECH_THRESHOLD:  # Configurable threshold
-            sf.write(fname, rec, target_samplerate)
-            return fname, speech_ratio
+                total_frames += 1
+            except Exception as e:
+                # If webrtcvad fails (e.g. unsupported rate), bail out gracefully
+                print(f"[ASR] VAD frame error: {e}; used_sr={used_sr}")
+                total_frames = 0
+                voiced_frames = 0
+                break
+
+        speech_ratio = (voiced_frames / total_frames) if total_frames > 0 else 0.0
+        print(f"[ASR] VAD: voiced_frames={voiced_frames}, total_frames={total_frames}, ratio={speech_ratio:.2f}")
+
+        # Save wav only if speech ratio exceeds threshold
+        if speech_ratio > VAD_SPEECH_THRESHOLD:
+            # Write file as int16 PCM with used_sr
+            sf.write(tmp_name, resampled, used_sr, subtype='PCM_16')
+            cleanup_files.append(tmp_name)
+            print(f"[ASR] Saved speech to {tmp_name}")
+            return tmp_name, speech_ratio, used_sr
         else:
-            if fname in cleanup_files:
-                cleanup_files.remove(fname)
-            return None, speech_ratio
-            
+            print(f"[ASR] Speech ratio below threshold ({VAD_SPEECH_THRESHOLD}); not saving.")
+            return None, speech_ratio, used_sr
+
     except Exception as e:
         print(f"[ASR] Recording failed: {e}")
         traceback.print_exc()
-        return None, 0.0
+        # Ensure tmp_name not left in cleanup_files
+        try:
+            if tmp_name in cleanup_files:
+                cleanup_files.remove(tmp_name)
+        except:
+            pass
+        return None, 0.0, None
 
 # --------------------------
 # ASR transcription
@@ -269,7 +386,7 @@ def transcribe_wav_file(path):
         with sr.AudioFile(path) as src:
             r.adjust_for_ambient_noise(src, duration=0.2)
             aud = r.record(src)
-        txt = r.recognize_google(aud)
+        txt = r.recognize_google(aud, language="en-IN")
         return txt.lower().strip()
     except sr.UnknownValueError:
         return ""
@@ -283,66 +400,206 @@ def transcribe_wav_file(path):
 # --------------------------
 # MediaPipe face detection
 # --------------------------
-mp_face_detection = mp.solutions.face_detection
-mp_drawing = mp.solutions.drawing_utils
+# ---------- Face detection + embedding helpers (replace existing versions) ----------
+# Requires: mediapipe, deepface, numpy, cv2
+import traceback
+import threading
+
+# persistent MediaPipe detector (create once)
+_mp_face_detection_module = mp.solutions.face_detection
+mp_drawing = mp.solutions.drawing_utils  # keep existing name
+
+# create a single detector instance to reuse (avoid re-creating every frame)
+# tune model_selection/min_detection_confidence if needed
+try:
+    _mp_face_detector = _mp_face_detection_module.FaceDetection(
+        model_selection=0,
+        min_detection_confidence=0.5
+    )
+except Exception as e:
+    print(f"[MEDIAPIPE] Failed to initialize FaceDetection: {e}")
+    _mp_face_detector = None
+
+# DeepFace model cache (lazy-loaded)
+_deepface_model_cache = {
+    "model": None,
+    "name": None,
+    "lock": threading.Lock()
+}
 
 def detect_faces_mediapipe(frame, confidence=0.5):
-    """Detect faces using MediaPipe (faster than Haar Cascade)"""
+    """
+    Detect faces using a persistent MediaPipe FaceDetection instance.
+
+    Returns:
+        list of (x, y, width, height) tuples in pixel coordinates (same as old function).
+    """
     faces = []
     try:
-        with mp_face_detection.FaceDetection(
-            model_selection=0,
-            min_detection_confidence=confidence
-        ) as face_detection:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = face_detection.process(rgb_frame)
-            
-            if results.detections:
-                h, w = frame.shape[:2]
-                for detection in results.detections:
-                    bbox = detection.location_data.relative_bounding_box
-                    x = int(bbox.xmin * w)
-                    y = int(bbox.ymin * h)
-                    width = int(bbox.width * w)
-                    height = int(bbox.height * h)
-                    
-                    # Ensure bbox is within frame
-                    x = max(0, x)
-                    y = max(0, y)
-                    width = min(width, w - x)
-                    height = min(height, h - y)
-                    
-                    faces.append((x, y, width, height))
+        if frame is None:
+            return faces
+
+        global _mp_face_detector
+        if _mp_face_detector is None:
+            # try to initialize lazily if previous attempt failed
+            try:
+                _mp_face_detector = _mp_face_detection_module.FaceDetection(
+                    model_selection=0,
+                    min_detection_confidence=confidence
+                )
+            except Exception as e:
+                print(f"[MEDIAPIPE] Could not initialize detector: {e}")
+                return faces
+
+        # MediaPipe expects RGB input
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = _mp_face_detector.process(rgb)
+
+        if not results or not results.detections:
+            return faces
+
+        h, w = frame.shape[:2]
+        for det in results.detections:
+            # relative bounding box -> absolute pixels
+            try:
+                rbox = det.location_data.relative_bounding_box
+                x = int(rbox.xmin * w)
+                y = int(rbox.ymin * h)
+                width = int(rbox.width * w)
+                height = int(rbox.height * h)
+
+                # clamp to frame
+                x = max(0, x)
+                y = max(0, y)
+                width = max(0, min(width, w - x))
+                height = max(0, min(height, h - y))
+
+                # optional: skip very small boxes
+                if width == 0 or height == 0:
+                    continue
+
+                faces.append((x, y, width, height))
+            except Exception as e:
+                print(f"[MEDIAPIPE] Detection parse error: {e}")
+                continue
+
     except Exception as e:
         print(f"[MEDIAPIPE] Detection error: {e}")
-    
+        traceback.print_exc()
+
     return faces
 
-# --------------------------
-# DeepFace embedding functions
-# --------------------------
+
+def _ensure_deepface_model(model_name="ArcFace"):
+    """
+    Ensure a DeepFace model is loaded and cached. Returns model object or None.
+    Thread-safe via lock to avoid races.
+    """
+    try:
+        with _deepface_model_cache["lock"]:
+            if _deepface_model_cache["model"] is not None and _deepface_model_cache["name"] == model_name:
+                return _deepface_model_cache["model"]
+
+            print(f"[DEEPFACE] Loading model '{model_name}' (this may take a moment)...")
+            model = DeepFace.build_model(model_name)
+            _deepface_model_cache["model"] = model
+            _deepface_model_cache["name"] = model_name
+            print("[DEEPFACE] Model loaded.")
+            return model
+    except Exception as e:
+        print(f"[DEEPFACE] Failed to load model {model_name}: {e}")
+        traceback.print_exc()
+        return None
+
+
+def _l2_normalize(emb):
+    emb = np.asarray(emb, dtype=np.float32)
+    norm = np.linalg.norm(emb)
+    if norm <= 1e-10:
+        return emb
+    return emb / norm
+
+
 def get_embedding_from_image(img_bgr, model_name="ArcFace", retry_count=2):
-    """Get face embedding with retry logic"""
+    """
+    Get face embedding with retry logic.
+    - img_bgr: BGR numpy image (a cropped face region or full image)
+    - returns: np.array(embedding, dtype=np.float32) or None
+    Keeps the same signature and return type as original function in your main.py.
+    """
+    # Defensive checks
+    if img_bgr is None:
+        return None
+
+    # DeepFace.represent accepts numpy arrays in many versions. We'll try to use a cached model.
     for attempt in range(retry_count):
         try:
+            model = _ensure_deepface_model(model_name)
+            if model is None:
+                # model load failed
+                if attempt < retry_count - 1:
+                    time.sleep(0.1)
+                    continue
+                return None
+
+            # DeepFace.represent: pass img array and the prebuilt model,
+            # set enforce_detection=False because we assume input is a cropped face,
+            # use detector_backend='skip' to avoid extra detection.
             rep = DeepFace.represent(
                 img_path=img_bgr,
                 model_name=model_name,
+                model=model,
                 enforce_detection=False,
-                detector_backend='skip'  # We already detected face with MediaPipe
+                detector_backend='skip'
             )
-            if isinstance(rep, list):
+
+            # DeepFace may return list/dict/array depending on version
+            if rep is None:
+                return None
+
+            if isinstance(rep, list) and len(rep) > 0:
                 rep = rep[0]
-            emb = np.array(rep["embedding"], dtype=np.float32)
-            return emb
+
+            if isinstance(rep, dict) and "embedding" in rep:
+                emb = np.array(rep["embedding"], dtype=np.float32)
+                emb = _l2_normalize(emb)
+                return emb
+
+            # fallback if rep is raw array-like
+            arr = np.asarray(rep, dtype=np.float32)
+            if arr.ndim == 1:
+                return _l2_normalize(arr)
+
+            # unknown response format
+            print("[DEEPFACE] Unexpected represent() return format")
+            return None
+
         except Exception as e:
+            # retry a few times (handle transient errors like small GPU/TF hiccups)
             if attempt < retry_count - 1:
-                print(f"[DEEPFACE] Retry {attempt + 1}/{retry_count}")
+                print(f"[DEEPFACE] Retry {attempt + 1}/{retry_count} after error: {e}")
                 time.sleep(0.1)
+                continue
             else:
                 print(f"[DEEPFACE] Embedding failed after {retry_count} attempts: {e}")
+                traceback.print_exc()
                 return None
+
     return None
+
+
+# helper to gracefully close the MediaPipe detector on shutdown
+def close_mediapipe_detector():
+    global _mp_face_detector
+    try:
+        if _mp_face_detector is not None:
+            _mp_face_detector.close()
+            _mp_face_detector = None
+            print("[MEDIAPIPE] Detector closed.")
+    except Exception as e:
+        print(f"[MEDIAPIPE] Error closing detector: {e}")
+
+# End of replacement block
 
 def cosine_distance(a, b):
     """Calculate cosine distance between embeddings"""
@@ -484,6 +741,13 @@ def matches_command(heard_text, command_phrase):
 # ASR listener thread
 # --------------------------
 class ASRListener(threading.Thread):
+    """
+    ASR listener thread with robust handling:
+    - Respects tts_active and asr_pause (so it won't listen while TTS or enrollment runs).
+    - Handles different return shapes from record_wav_with_vad (2-tuple or 3-tuple).
+    - Cleans up temp files safely (only if they exist).
+    - Puts final transcribed text into the queue (if any).
+    """
     def __init__(self, out_q, stop_event):
         super().__init__(daemon=True)
         self.q = out_q
@@ -493,214 +757,285 @@ class ASRListener(threading.Thread):
     def run(self):
         print("[ASR] Listener started with VAD")
         consecutive_silence = 0
-        
+
         while not self.stop_event.is_set() and self.running:
             try:
-                # Wait if TTS is active
-                if tts_active.is_set():
+                # Respect TTS and explicit pause (enrollment)
+                if tts_active.is_set() or asr_pause.is_set():
                     time.sleep(0.1)
                     continue
-                
-                fname, speech_ratio = record_wav_with_vad(
-                    INPUT_DEVICE_INDEX,
-                    ASR_RECORD_SECONDS
-                )
-                
-                if not fname:
+
+                # Call the recorder. Record function may return a 2-tuple or 3-tuple;
+                # handle both robustly.
+                try:
+                    res,_,_ = record_wav_with_vad(INPUT_DEVICE_INDEX, ASR_RECORD_SECONDS)
+                except Exception as e:
+                    print(f"[ASR] Recording failed (exception): {e}")
+                    traceback.print_exc()
+                    time.sleep(0.1)
+                    continue
+
+                if not res:
                     consecutive_silence += 1
                     if consecutive_silence % 10 == 0:
                         print(f"[ASR] Listening... (silence count: {consecutive_silence})")
                     time.sleep(0.05)
                     continue
-                
+
+                # Normalize result into (fname, speech_ratio)
+                if isinstance(res, tuple):
+                    if len(res) >= 2:
+                        fname = res[0]
+                        speech_ratio = res[1]
+                    elif len(res) == 1:
+                        fname = res[0]
+                        speech_ratio = 0.0
+                    else:
+                        fname = None
+                        speech_ratio = 0.0
+                else:
+                    # Unexpected return type
+                    print("[ASR] Unexpected recorder return type; skipping")
+                    time.sleep(0.05)
+                    continue
+
+                if not fname:
+                    # Voice was too weak / recorder skipped saving
+                    consecutive_silence += 1
+                    if consecutive_silence % 10 == 0:
+                        print(f"[ASR] Listening... (silence count: {consecutive_silence})")
+                    time.sleep(0.05)
+                    continue
+
                 consecutive_silence = 0
-                # Don't print speech detection ratio every time - too noisy
-                
-                txt = transcribe_wav_file(fname)
-                
-                # Cleanup temp file
+
+                # Transcribe safely
+                txt = ""
+                try:
+                    txt = transcribe_wav_file(fname)
+                except Exception as e:
+                    print(f"[ASR] Transcription exception: {e}")
+                    traceback.print_exc()
+                    txt = ""
+
+                # Remove temp file if it exists and is in our cleanup list
                 try:
                     if fname in cleanup_files:
-                        cleanup_files.remove(fname)
+                        try:
+                            cleanup_files.remove(fname)
+                        except ValueError:
+                            pass
                     if os.path.exists(fname):
                         os.remove(fname)
-                except:
-                    pass
-                
+                except Exception as e:
+                    print(f"[ASR] Warning: failed to remove temp file {fname}: {e}")
+
                 if txt:
-                    print(f"[ASR] >>> HEARD: \"{txt}\"")  # Clear output of what was heard
+                    # Show exactly what we heard
+                    print(f"[ASR] >>> HEARD: \"{txt}\"")
                     self.q.put(txt)
                 else:
-                    print(f"[ASR] (Speech detected but couldn't transcribe)")
-                
+                    print(f"[ASR] (Speech detected but could not transcribe)")
+
+                # Small sleep to avoid hot loop
                 time.sleep(0.05)
-                
+
             except Exception as e:
+                # Keep thread alive on unexpected errors
                 print(f"[ASR] Error in listener loop: {e}")
                 traceback.print_exc()
                 time.sleep(0.5)
 
     def stop(self):
         self.running = False
-
 # --------------------------
 # Enrollment process (FIXED)
 # --------------------------
 def perform_enrollment(cam, enrolled_db):
-    """Voice-guided enrollment with proper face validation"""
-    say("Starting enrollment. Please say the name after the beep.")
-    time.sleep(0.5)
-    say("Beep.")
-    
-    # Record name
-    name_file, _ = record_wav_with_vad(INPUT_DEVICE_INDEX, ENROLL_NAME_RECORD_SECONDS)
-    if not name_file:
-        say("Could not record name. Enrollment cancelled.")
-        return enrolled_db
-    
-    name_text = transcribe_wav_file(name_file)
-    
-    # Cleanup
+    """
+    Voice-guided (but typed-name) enrollment with robust face validation and safe saves.
+    - Pauses ASR while running (sets asr_pause).
+    - Asks user to type a name (no speech name required).
+    - Captures ENROLL_PHOTOS poses with guidance prompts.
+    - Validates crops, ensures non-empty and minimum size before passing to DeepFace.
+    - Computes embeddings with retries and saves using save_enrollment().
+    - Restores ASR state and returns updated enrolled_db.
+    """
+    # Pause ASR to avoid interference
+    asr_pause.set()
     try:
-        if name_file in cleanup_files:
-            cleanup_files.remove(name_file)
-        if os.path.exists(name_file):
-            os.remove(name_file)
-    except:
-        pass
-    
-    if not name_text:
-        say("I could not understand the name. Enrollment cancelled.")
-        return enrolled_db
-    
-    spoken_name = name_text.split()[0].lower()
-    print(f"[ENROLL] Enrolling: '{spoken_name}'")
-    say(f"Enrolling {spoken_name}. I will capture your face from different angles.")
-    
-    # Pose prompts
-    pose_prompts = [
-        "Look straight at the camera",
-        "Turn your head slightly to the left",
-        "Turn your head slightly to the right",
-        "Tilt your head slightly up",
-        "Tilt your head slightly down"
-    ]
-    
-    captures = []
-    say("Get ready. Position your face in the green box.")
-    time.sleep(1.0)
-    
-    for idx, prompt in enumerate(pose_prompts[:ENROLL_PHOTOS]):
-        say(prompt)
-        time.sleep(1.5)
-        
-        best_crop = None
-        best_area = 0
-        
-        # Try to capture for 1.5 seconds
-        start_time = time.time()
-        while time.time() - start_time < 1.5:
-            ret, frame = cam.read()
-            if not ret:
-                continue
-            
-            faces = detect_faces_mediapipe(frame, confidence=0.7)
-            
-            # Display guidance
-            display = frame.copy()
-            h, w = display.shape[:2]
-            cv2.putText(
-                display,
-                f"Enrollment: {idx + 1}/{ENROLL_PHOTOS}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2
-            )
-            cv2.putText(
-                display,
-                prompt,
-                (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                1
-            )
-            
-            # Draw target box
-            cx1, cy1 = int(w * 0.3), int(h * 0.2)
-            cx2, cy2 = int(w * 0.7), int(h * 0.8)
-            cv2.rectangle(display, (cx1, cy1), (cx2, cy2), (0, 255, 0), 2)
-            
-            # Draw detected faces
-            for (x, y, fw, fh) in faces:
-                cv2.rectangle(display, (x, y), (x + fw, y + fh), (255, 0, 0), 2)
-                area = fw * fh
-                if area > best_area:
-                    best_area = area
-                    best_crop = frame[y:y + fh, x:x + fw].copy()
-            
-            cv2.imshow("Enrollment (ESC to cancel)", display)
-            k = cv2.waitKey(30) & 0xFF
-            if k == 27:
-                say("Enrollment cancelled.")
-                cv2.destroyAllWindows()
-                return enrolled_db
-        
-        if best_crop is not None and best_crop.size > 0:
-            captures.append(best_crop)
-            say(f"Captured pose {idx + 1}")
-            print(f"[ENROLL] Captured pose {idx + 1}, area={best_area}")
-        else:
-            say(f"No face detected for this pose. Skipping.")
-            print(f"[ENROLL] No face for pose {idx + 1}")
-    
-    cv2.destroyAllWindows()
-    
-    if len(captures) < 2:
-        say("Enrollment failed. Not enough valid captures. Please try again.")
-        return enrolled_db
-    
-    say("Computing face embeddings. Please wait.")
-    embeddings = []
-    
-    for i, img in enumerate(captures):
-        print(f"[ENROLL] Computing embedding {i + 1}/{len(captures)}...")
-        emb = get_embedding_from_image(img)
-        if emb is not None:
-            embeddings.append(emb)
-        else:
-            print(f"[ENROLL] Failed to compute embedding for capture {i + 1}")
-    
-    if len(embeddings) < 2:
-        say("Enrollment failed. Could not extract face features. Please try again.")
-        return enrolled_db
-    
-    # Validate consistency (optional but recommended)
-    if len(embeddings) >= 2:
+        say("Starting enrollment. Please type the person's name in the terminal.")
+        # Give audible prompt then ask for typed input
+        time.sleep(0.2)
+        print("\n[ENROLL] Please type the name for enrollment (or leave blank to cancel):")
+        try:
+            spoken_name = input("Name to enroll: ").strip()
+        except Exception as e:
+            print(f"[ENROLL] Input error: {e}")
+            say("Could not read name. Enrollment cancelled.")
+            return enrolled_db
+
+        if not spoken_name:
+            say("Enrollment cancelled.")
+            print("[ENROLL] Cancelled by user (no name provided).")
+            return enrolled_db
+
+        # sanitize and lower-case storage name
+        spoken_name_key = "".join(ch for ch in spoken_name if ch.isalnum() or ch in (" ", "_", "-")).strip().lower()
+        if not spoken_name_key:
+            say("Provided name is invalid. Enrollment cancelled.")
+            return enrolled_db
+
+        print(f"[ENROLL] Proceeding to enroll: '{spoken_name_key}'")
+        say(f"Enrolling {spoken_name}. I will capture your face from different angles. Please follow the instructions on screen.")
+
+        # Pose prompts
+        pose_prompts = [
+            "Look straight at the camera",
+            "Turn your head slightly to the left",
+            "Turn your head slightly to the right",
+            "Tilt your head slightly up",
+            "Tilt your head slightly down"
+        ]
+
+        captures = []
+        say("Get ready. Position your face inside the green box.")
+        time.sleep(1.0)
+
+        # Capture loop (main thread; uses the provided cam)
+        for idx, prompt in enumerate(pose_prompts[:ENROLL_PHOTOS]):
+            say(prompt)
+            time.sleep(1.0)
+
+            best_crop = None
+            best_area = 0
+
+            start_time = time.time()
+            while time.time() - start_time < 1.5:
+                ret, frame = cam.read()
+                if not ret:
+                    time.sleep(0.01)
+                    continue
+
+                faces = detect_faces_mediapipe(frame, confidence=0.65)
+
+                # UI guidance
+                display = frame.copy()
+                h, w = display.shape[:2]
+                cv2.putText(display, f"Enrollment: {idx + 1}/{ENROLL_PHOTOS}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.putText(display, prompt, (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+                # Draw green target box to encourage consistent framing
+                cx1, cy1 = int(w * 0.3), int(h * 0.2)
+                cx2, cy2 = int(w * 0.7), int(h * 0.8)
+                cv2.rectangle(display, (cx1, cy1), (cx2, cy2), (0, 255, 0), 2)
+
+                # Draw detected faces and pick the largest
+                for (x, y, fw, fh) in faces:
+                    cv2.rectangle(display, (x, y), (x + fw, y + fh), (255, 0, 0), 2)
+                    area = fw * fh
+                    # Ensure bbox is inside frame
+                    if fw <= 0 or fh <= 0:
+                        continue
+                    if area > best_area:
+                        # Validate coordinates still safe
+                        x0 = max(0, x); y0 = max(0, y)
+                        x1 = min(w, x + fw); y1 = min(h, y + fh)
+                        crop_h = y1 - y0; crop_w = x1 - x0
+                        if crop_h > 24 and crop_w > 24:
+                            candidate = frame[y0:y1, x0:x1].copy()
+                            # guarantee proper dtype/contiguous
+                            candidate = np.ascontiguousarray(candidate.astype(np.uint8))
+                            if candidate.size > 0:
+                                best_area = area
+                                best_crop = candidate
+
+                cv2.imshow("Enrollment (ESC to cancel)", display)
+                k = cv2.waitKey(30) & 0xFF
+                if k == 27:
+                    say("Enrollment cancelled.")
+                    cv2.destroyAllWindows()
+                    print("[ENROLL] Cancelled by user (ESC pressed).")
+                    return enrolled_db
+
+            # End capture attempt for this pose
+            if best_crop is not None and best_crop.size > 0:
+                # Additional safety: require a minimal resolution
+                if best_crop.shape[0] < 40 or best_crop.shape[1] < 40:
+                    say("Face too small for reliable enrollment. Please move closer and try again.")
+                    print(f"[ENROLL] Skipped: capture too small ({best_crop.shape})")
+                else:
+                    captures.append(best_crop)
+                    say(f"Captured pose {idx + 1}")
+                    print(f"[ENROLL] Captured pose {idx + 1}, area={best_area}, shape={best_crop.shape}")
+            else:
+                say("No clear face detected for this pose. Skipping this pose.")
+                print(f"[ENROLL] No face detected for pose {idx + 1}")
+
+        # Close the enrollment window(s)
+        cv2.destroyAllWindows()
+
+        # Need at least two good captures for embedding consistency check
+        if len(captures) < 2:
+            say("Enrollment failed. Not enough valid captures. Please try again.")
+            print("[ENROLL] Failed: not enough valid captures.")
+            return enrolled_db
+
+        say("Computing face embeddings. Please wait.")
+        embeddings = []
+
+        for i, img in enumerate(captures):
+            print(f"[ENROLL] Computing embedding {i + 1}/{len(captures)}...")
+            try:
+                emb = get_embedding_from_image(img)
+                if emb is not None:
+                    embeddings.append(emb)
+                else:
+                    print(f"[ENROLL] get_embedding_from_image returned None for capture {i + 1}")
+            except Exception as e:
+                print(f"[ENROLL] Exception computing embedding for capture {i + 1}: {e}")
+                traceback.print_exc()
+
+        if len(embeddings) < 2:
+            say("Enrollment failed. Could not extract reliable face features. Please try again.")
+            print("[ENROLL] Failed: insufficient embeddings extracted.")
+            return enrolled_db
+
+        # Consistency check
         distances = []
         for i in range(len(embeddings)):
             for j in range(i + 1, len(embeddings)):
-                dist = cosine_distance(embeddings[i], embeddings[j])
-                distances.append(dist)
-        
-        avg_dist = np.mean(distances)
-        print(f"[ENROLL] Average intra-person distance: {avg_dist:.3f}")
-        
+                distances.append(cosine_distance(embeddings[i], embeddings[j]))
+        avg_dist = float(np.mean(distances)) if distances else 1.0
+        print(f"[ENROLL] Average intra-person distance: {avg_dist:.4f}")
         if avg_dist > 0.5:
-            say("Warning: Face captures show high variation. Enrollment may not be reliable.")
-    
-    # Save enrollment
-    if save_enrollment(spoken_name, embeddings):
-        enrolled_db = load_enrolled_db()
-        say(f"Enrollment complete for {spoken_name}. {len(embeddings)} face embeddings saved.")
-        print(f"[ENROLL] Success: '{spoken_name}' enrolled with {len(embeddings)} embeddings")
-    else:
-        say("Failed to save enrollment data.")
-    
-    return enrolled_db
+            say("Warning: face captures show high variation. Enrollment may be less reliable.")
 
+        # Save enrollment
+        saved = False
+        try:
+            saved = save_enrollment(spoken_name_key, embeddings)
+        except Exception as e:
+            print(f"[ENROLL] Error saving enrollment: {e}")
+            traceback.print_exc()
+            saved = False
+
+        if saved:
+            # reload DB to update in-memory state
+            enrolled_db = load_enrolled_db()
+            say(f"Enrollment complete for {spoken_name}. {len(embeddings)} embeddings saved.")
+            print(f"[ENROLL] Success: '{spoken_name_key}' enrolled with {len(embeddings)} embeddings")
+        else:
+            say("Failed to save enrollment data. Please check disk permissions and try again.")
+            print("[ENROLL] Failed to save enrollment data.")
+
+        return enrolled_db
+
+    finally:
+        # Always resume ASR regardless of outcome
+        asr_pause.clear()
 # --------------------------
 # Main guard loop
 # --------------------------
