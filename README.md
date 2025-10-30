@@ -35,6 +35,7 @@ python main.py
 
 ## FlowChart
 
+```mermaid
 flowchart TD
 
 %% ========= SYSTEM INITIALIZATION =========
@@ -156,4 +157,4 @@ class ASRListener,A1,A2,A3,A4,A5,A6,A7,A8,A9 asr;
 class MAIN,M1,M2,Activate,Deactivate,EnrollCmd,IgnoreCmd,Frame,Process,Faces,ForEach,Match,Known,Unknown,Escalate,Warn,EndLoop main;
 class ENROLLMENT,E1,E2,E3,E4,E5,E6,E7,E8 enroll;
 class Exit,Shutdown,Cleanup,End cleanup;
-
+```
